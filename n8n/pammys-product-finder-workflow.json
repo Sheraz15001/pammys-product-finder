@@ -1,0 +1,500 @@
+{
+  "name": "My workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "product-search",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "http://localhost:5173"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1136,
+        288
+      ],
+      "id": "ca76e0bf-0d2c-4976-8e78-7efe221e3e00",
+      "name": "Webhook",
+      "webhookId": "e00e3624-ab66-4437-a9d2-cdf9e9cbaa14"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ============================================================\n// PAMMYS PRODUCT MATCHER — COMPLETE REPLACEMENT\n// Deterministic matching only. The AI Agent only phrases replies.\n// ============================================================\n\n// ------------------------------------------------------------\n// 1. REQUEST + DATA\n// ------------------------------------------------------------\nconst request = $(\"Webhook\").first().json.body || {};\nconst message = String(request.message || \"\").trim();\nconst locale = String(request.locale || \"en\").trim().toLowerCase();\nconst sessionId = request.session_id || null;\nconst rows = $input.all();\n\n// ------------------------------------------------------------\n// 2. NORMALIZATION + FUZZY HELPERS\n// ------------------------------------------------------------\nfunction normalize(value) {\n  return String(value || \"\")\n    .toLowerCase()\n    .replace(/ß/g, \"ss\")\n    .normalize(\"NFD\")\n    .replace(/[\\u0300-\\u036f]/g, \"\")\n    .replace(/,/g, \".\")\n    .replace(/[’']/g, \"\")\n    .replace(/[^a-z0-9/.+-]+/g, \" \")\n    .replace(/\\s+/g, \" \")\n    .trim();\n}\n\nfunction tokenize(value) {\n  return normalize(value)\n    .split(\" \")\n    .map((token) => token.replace(/^[./+-]+|[./+-]+$/g, \"\"))\n    .filter(Boolean);\n}\n\nfunction unique(values) {\n  return [...new Set(values)];\n}\n\nfunction sortNatural(values) {\n  return [...values].sort((a, b) =>\n    String(a).localeCompare(String(b), undefined, {\n      numeric: true,\n      sensitivity: \"base\",\n    })\n  );\n}\n\nfunction editDistance(a, b) {\n  a = normalize(a);\n  b = normalize(b);\n\n  const matrix = Array.from({ length: a.length + 1 }, () =>\n    Array(b.length + 1).fill(0)\n  );\n\n  for (let i = 0; i <= a.length; i++) matrix[i][0] = i;\n  for (let j = 0; j <= b.length; j++) matrix[0][j] = j;\n\n  for (let i = 1; i <= a.length; i++) {\n    for (let j = 1; j <= b.length; j++) {\n      const cost = a[i - 1] === b[j - 1] ? 0 : 1;\n\n      matrix[i][j] = Math.min(\n        matrix[i - 1][j] + 1,\n        matrix[i][j - 1] + 1,\n        matrix[i - 1][j - 1] + cost\n      );\n\n      if (\n        i > 1 &&\n        j > 1 &&\n        a[i - 1] === b[j - 2] &&\n        a[i - 2] === b[j - 1]\n      ) {\n        matrix[i][j] = Math.min(\n          matrix[i][j],\n          matrix[i - 2][j - 2] + 1\n        );\n      }\n    }\n  }\n\n  return matrix[a.length][b.length];\n}\n\nfunction similarity(a, b) {\n  a = normalize(a);\n  b = normalize(b);\n\n  if (!a || !b) return 0;\n  if (a === b) return 1;\n\n  const aNumber = /^\\d+(?:\\.\\d+)?$/.test(a);\n  const bNumber = /^\\d+(?:\\.\\d+)?$/.test(b);\n\n  if (aNumber || bNumber) {\n    return a === b ? 1 : 0;\n  }\n\n  return 1 - editDistance(a, b) / Math.max(a.length, b.length);\n}\n\nfunction isStrongWordMatch(a, b) {\n  a = normalize(a);\n  b = normalize(b);\n\n  if (!a || !b) return false;\n  if (a === b) return true;\n\n  const aNumber = /^\\d+(?:\\.\\d+)?$/.test(a);\n  const bNumber = /^\\d+(?:\\.\\d+)?$/.test(b);\n\n  if (aNumber || bNumber) {\n    return a === b;\n  }\n\n  const minLength = Math.min(a.length, b.length);\n  const distance = editDistance(a, b);\n\n  if (minLength >= 4 && distance <= 1) {\n    return true;\n  }\n\n  if (minLength >= 7 && distance <= 2) {\n    return true;\n  }\n\n  if (\n    minLength >= 5 &&\n    (a.startsWith(b) || b.startsWith(a))\n  ) {\n    return true;\n  }\n\n  return false;\n}\n\n// ------------------------------------------------------------\n// 3. PRODUCT TITLE PARSING\n// Model - Color - Size, parsed from the right.\n// ------------------------------------------------------------\nconst products = rows\n  .map((item) => {\n    const row = item.json || {};\n    const title = String(row.product_title || \"\").trim();\n\n    const parts = title\n      .split(/\\s+-\\s+/)\n      .map((part) => part.trim());\n\n    if (parts.length < 3) {\n      return null;\n    }\n\n    const size = parts.pop();\n    const color = parts.pop();\n    const model = parts.join(\" - \");\n\n    return {\n      id: row.id,\n      title,\n      image_url: row.image_url || \"\",\n      status: row.status || \"\",\n      model,\n      color,\n      size,\n    };\n  })\n  .filter(Boolean)\n  .filter(\n    (product) =>\n      !product.status ||\n      normalize(product.status) === \"active\"\n  );\n\nif (products.length === 0) {\n  throw new Error(\n    \"No products were received from the Pammys Products Data Table.\"\n  );\n}\n\nconst q = normalize(message);\nconst queryTokens = tokenize(message);\n\nconst models = unique(\n  products.map((product) => product.model)\n);\n\n// ------------------------------------------------------------\n// 4. STOP WORDS\n// ------------------------------------------------------------\nconst stopWords = new Set([\n  // English\n  \"i\",\n  \"im\",\n  \"am\",\n  \"want\",\n  \"wanna\",\n  \"would\",\n  \"like\",\n  \"looking\",\n  \"look\",\n  \"show\",\n  \"find\",\n  \"need\",\n  \"give\",\n  \"get\",\n  \"have\",\n  \"please\",\n  \"me\",\n  \"you\",\n  \"for\",\n  \"with\",\n  \"in\",\n  \"on\",\n  \"of\",\n  \"a\",\n  \"an\",\n  \"the\",\n  \"pair\",\n  \"product\",\n  \"shoe\",\n  \"shoes\",\n  \"size\",\n  \"color\",\n  \"colour\",\n\n  // German\n  \"ich\",\n  \"suche\",\n  \"mochte\",\n  \"moechte\",\n  \"will\",\n  \"bitte\",\n  \"zeige\",\n  \"mir\",\n  \"mit\",\n  \"fur\",\n  \"fuer\",\n  \"der\",\n  \"die\",\n  \"das\",\n  \"ein\",\n  \"eine\",\n  \"farbe\",\n  \"grosse\",\n  \"groesse\",\n  \"schuh\",\n  \"schuhe\",\n\n  // French\n  \"je\",\n  \"cherche\",\n  \"veux\",\n  \"voudrais\",\n  \"montre\",\n  \"moi\",\n  \"avec\",\n  \"pour\",\n  \"de\",\n  \"des\",\n  \"du\",\n  \"la\",\n  \"le\",\n  \"les\",\n  \"couleur\",\n  \"taille\",\n  \"chaussure\",\n  \"chaussures\",\n\n  // Spanish\n  \"yo\",\n  \"busco\",\n  \"quiero\",\n  \"muestra\",\n  \"con\",\n  \"para\",\n  \"de\",\n  \"del\",\n  \"la\",\n  \"el\",\n  \"los\",\n  \"las\",\n  \"color\",\n  \"talla\",\n  \"zapato\",\n  \"zapatos\",\n]);\n\nfunction isStopWord(token) {\n  return stopWords.has(normalize(token));\n}\n\n// ------------------------------------------------------------\n// 5. OUTPUT HELPERS\n// ------------------------------------------------------------\nfunction productPreview(list, limit = 30) {\n  return list.slice(0, limit).map((product) => ({\n    id: product.id,\n    title: product.title,\n    image_url: product.image_url,\n    model: product.model,\n    color: product.color,\n    size: product.size,\n  }));\n}\n\nfunction questionResult({\n  questionKey,\n  options,\n  context,\n  candidates = [],\n  topCandidates = [],\n}) {\n  const preview = productPreview(candidates);\n\n  return [\n    {\n      json: {\n        type: questionKey,\n        question_key: questionKey,\n\n        options: Array.isArray(options)\n          ? options\n          : [],\n\n        matched_candidates: preview,\n\n        context: {\n          ...context,\n\n          matched_candidates: preview,\n\n          ...(topCandidates.length\n            ? {\n                top_candidates:\n                  topCandidates,\n              }\n            : {}),\n        },\n      },\n    },\n  ];\n}\n\n// ------------------------------------------------------------\n// 6. SPECIFIC MODEL ALIASES\n//\n// IMPORTANT:\n// Generic words such as \"women\", \"mujer\", \"Damen\",\n// \"men\", \"hombre\" are NOT mapped directly to a model.\n// ------------------------------------------------------------\nconst modelAliases = {\n  \"Snowboots 2.0\": [\n    \"snow boots 2.0\",\n    \"snowboot 2.0\",\n  ],\n\n  \"Originals Woman\": [\n    \"original woman\",\n    \"originals women\",\n  ],\n\n  \"Originals Men\": [\n    \"original men\",\n    \"originals man\",\n  ],\n\n  \"Step-Ins 3.0 Women\": [\n    \"step ins 3.0 women\",\n    \"stepins 3.0 women\",\n  ],\n\n  \"Step-Ins 3.0 Men\": [\n    \"step ins 3.0 men\",\n    \"stepins 3.0 men\",\n  ],\n\n  \"Step-Ins 3.0 Kids\": [\n    \"step ins 3.0 kids\",\n    \"stepins 3.0 kids\",\n  ],\n\n  \"Retro Sneaker 2.0\": [\n    \"retro sneakers 2.0\",\n  ],\n};\n\nfunction phraseScore(query, phrase) {\n  const qTokens = tokenize(query);\n  const pTokens = tokenize(phrase);\n\n  if (\n    !qTokens.length ||\n    !pTokens.length\n  ) {\n    return 0;\n  }\n\n  let total = 0;\n  let matched = 0;\n\n  for (const pToken of pTokens) {\n    let best = 0;\n\n    for (const qToken of qTokens) {\n      const sim =\n        similarity(pToken, qToken);\n\n      if (\n        isStrongWordMatch(\n          pToken,\n          qToken\n        ) ||\n        sim >= 0.76\n      ) {\n        best = Math.max(\n          best,\n          sim\n        );\n      }\n    }\n\n    if (best > 0) {\n      matched++;\n      total += best;\n    }\n  }\n\n  const coverage =\n    matched / pTokens.length;\n\n  if (coverage < 0.7) {\n    return 0;\n  }\n\n  return (\n    (total / pTokens.length) *\n      0.7 +\n    coverage * 0.3\n  );\n}\n\n// ------------------------------------------------------------\n// 7. GENERIC GENDER / CATEGORY HINTS\n//\n// Generic gender terms restrict candidate models.\n// They NEVER automatically choose \"Originals Woman\"\n// or \"Originals Men\".\n// ------------------------------------------------------------\nconst genderHints = {\n  female: [\n    // English\n    \"woman\",\n    \"women\",\n    \"womens\",\n    \"lady\",\n    \"ladies\",\n    \"ladys\",\n\n    // German\n    \"dame\",\n    \"damen\",\n    \"damenschuh\",\n    \"damenschuhe\",\n    \"frau\",\n    \"frauen\",\n    \"frauenschuh\",\n    \"frauenschuhe\",\n\n    // French\n    \"femme\",\n    \"femmes\",\n\n    // Spanish\n    \"mujer\",\n    \"mujeres\",\n  ],\n\n  male: [\n    // English\n    \"man\",\n    \"men\",\n    \"mens\",\n\n    // German\n    \"herr\",\n    \"herren\",\n    \"herrenschuh\",\n    \"herrenschuhe\",\n    \"mann\",\n    \"manner\",\n    \"mannerschuh\",\n    \"mannerschuhe\",\n\n    // French\n    \"homme\",\n    \"hommes\",\n\n    // Spanish\n    \"hombre\",\n    \"hombres\",\n  ],\n};\n\nfunction hintMatches(\n  queryToken,\n  hint\n) {\n  // Spanish:\n  // \"dame\" = \"give me\".\n  //\n  // Therefore singular \"dame\"\n  // counts as a female word only\n  // when selected locale = German.\n  if (\n    normalize(hint) === \"dame\" &&\n    locale !== \"de\"\n  ) {\n    return false;\n  }\n\n  return (\n    normalize(queryToken) ===\n      normalize(hint) ||\n    isStrongWordMatch(\n      queryToken,\n      hint\n    )\n  );\n}\n\nfunction detectGenderHint() {\n  let female = 0;\n  let male = 0;\n\n  for (\n    const queryToken of\n      queryTokens\n  ) {\n    if (\n      genderHints.female.some(\n        (hint) =>\n          hintMatches(\n            queryToken,\n            hint\n          )\n      )\n    ) {\n      female++;\n    }\n\n    if (\n      genderHints.male.some(\n        (hint) =>\n          hintMatches(\n            queryToken,\n            hint\n          )\n      )\n    ) {\n      male++;\n    }\n  }\n\n  if (\n    female > 0 &&\n    male === 0\n  ) {\n    return \"female\";\n  }\n\n  if (\n    male > 0 &&\n    female === 0\n  ) {\n    return \"male\";\n  }\n\n  if (female > male) {\n    return \"female\";\n  }\n\n  if (male > female) {\n    return \"male\";\n  }\n\n  return null;\n}\n\nfunction modelGender(\n  candidateModel\n) {\n  const tokens =\n    tokenize(candidateModel);\n\n  const femaleMarkers =\n    new Set([\n      \"woman\",\n      \"women\",\n      \"womens\",\n      \"female\",\n      \"lady\",\n      \"ladies\",\n    ]);\n\n  const maleMarkers =\n    new Set([\n      \"man\",\n      \"men\",\n      \"mens\",\n      \"male\",\n    ]);\n\n  const isFemale =\n    tokens.some(\n      (token) =>\n        femaleMarkers.has(token)\n    );\n\n  const isMale =\n    tokens.some(\n      (token) =>\n        maleMarkers.has(token)\n    );\n\n  if (\n    isFemale &&\n    !isMale\n  ) {\n    return \"female\";\n  }\n\n  if (\n    isMale &&\n    !isFemale\n  ) {\n    return \"male\";\n  }\n\n  return null;\n}\n\nconst genderHint =\n  detectGenderHint();\n\n// ------------------------------------------------------------\n// 8. MODEL SCORING\n// ------------------------------------------------------------\nfunction scoreSpecificModel(\n  candidateModel\n) {\n  const modelTokens =\n    tokenize(candidateModel);\n\n  const usefulQueryTokens =\n    queryTokens.filter(\n      (token) =>\n        !isStopWord(token)\n    );\n\n  if (\n    !modelTokens.length ||\n    !usefulQueryTokens.length\n  ) {\n    return {\n      score: 0,\n      matched: 0,\n      coverage: 0,\n    };\n  }\n\n  let total = 0;\n  let matched = 0;\n\n  for (\n    const modelToken of\n      modelTokens\n  ) {\n    let best = 0;\n\n    for (\n      const queryToken of\n        usefulQueryTokens\n    ) {\n      const sim =\n        similarity(\n          modelToken,\n          queryToken\n        );\n\n      if (\n        isStrongWordMatch(\n          modelToken,\n          queryToken\n        ) ||\n        sim >= 0.76\n      ) {\n        best = Math.max(\n          best,\n          sim\n        );\n      }\n    }\n\n    if (best > 0) {\n      matched++;\n      total += best;\n    }\n  }\n\n  const coverage =\n    matched /\n    modelTokens.length;\n\n  const average =\n    matched\n      ? total / matched\n      : 0;\n\n  const score =\n    average * 0.65 +\n    coverage * 0.35;\n\n  return {\n    score,\n    matched,\n    coverage,\n  };\n}\n\nlet model = null;\n\n// ------------------------------------------------------------\n// A. EXACT MODEL\n// ------------------------------------------------------------\nconst exactModelMatches =\n  models\n    .filter(\n      (candidateModel) =>\n        q.includes(\n          normalize(\n            candidateModel\n          )\n        )\n    )\n    .sort(\n      (a, b) =>\n        normalize(b).length -\n        normalize(a).length\n    );\n\nif (\n  exactModelMatches.length\n) {\n  model =\n    exactModelMatches[0];\n}\n\n// ------------------------------------------------------------\n// B. SPECIFIC ALIASES\n// ------------------------------------------------------------\nif (!model) {\n  const aliasMatches = [];\n\n  for (\n    const [\n      targetModel,\n      aliases,\n    ] of Object.entries(\n      modelAliases\n    )\n  ) {\n    if (\n      !models.includes(\n        targetModel\n      )\n    ) {\n      continue;\n    }\n\n    let bestScore = 0;\n\n    for (\n      const alias of aliases\n    ) {\n      bestScore =\n        Math.max(\n          bestScore,\n          phraseScore(\n            message,\n            alias\n          )\n        );\n    }\n\n    if (\n      bestScore >= 0.78\n    ) {\n      aliasMatches.push({\n        model: targetModel,\n        score: bestScore,\n      });\n    }\n  }\n\n  aliasMatches.sort(\n    (a, b) =>\n      b.score - a.score\n  );\n\n  if (\n    aliasMatches.length &&\n    (\n      !aliasMatches[1] ||\n      aliasMatches[0].score -\n        aliasMatches[1].score >=\n        0.07\n    )\n  ) {\n    model =\n      aliasMatches[0].model;\n  }\n}\n\n// ------------------------------------------------------------\n// C. STRONG FUZZY SPECIFIC MODEL\n//\n// Generic \"women\" must NOT choose one specific\n// female model.\n//\n// But:\n// \"Orignals Womam\"\n// SHOULD choose Originals Woman.\n// ------------------------------------------------------------\nif (!model) {\n  const scored =\n    models\n      .map(\n        (\n          candidateModel\n        ) => ({\n          model:\n            candidateModel,\n\n          ...scoreSpecificModel(\n            candidateModel\n          ),\n        })\n      )\n      .sort(\n        (a, b) =>\n          b.score - a.score\n      );\n\n  const strong =\n    scored.filter(\n      (item) => {\n        const tokenCount =\n          tokenize(\n            item.model\n          ).length;\n\n        // Single-token models:\n        // Hugy -> Huggy\n        if (\n          tokenCount === 1\n        ) {\n          return (\n            item.matched >= 1 &&\n            item.score >= 0.82\n          );\n        }\n\n        // Multi-token models require\n        // at least two matching model words.\n        return (\n          item.matched >= 2 &&\n          item.coverage >= 0.66 &&\n          item.score >= 0.78\n        );\n      }\n    );\n\n  if (\n    strong.length &&\n    (\n      !strong[1] ||\n      strong[0].score -\n        strong[1].score >=\n        0.06\n    )\n  ) {\n    model =\n      strong[0].model;\n  }\n}\n\n// ------------------------------------------------------------\n// D. GENERIC WOMEN / MEN REQUEST\n//\n// Now, only after trying to identify a SPECIFIC model,\n// use gender/category information.\n// ------------------------------------------------------------\nif (\n  !model &&\n  genderHint\n) {\n  const genderModels =\n    models.filter(\n      (candidateModel) =>\n        modelGender(\n          candidateModel\n        ) === genderHint\n    );\n\n  if (\n    genderModels.length === 1\n  ) {\n    model =\n      genderModels[0];\n  } else if (\n    genderModels.length > 1\n  ) {\n    const candidates =\n      products.filter(\n        (product) =>\n          genderModels.includes(\n            product.model\n          )\n      );\n\n    return questionResult({\n      questionKey:\n        \"ambiguous_model\",\n\n      options:\n        sortNatural(\n          genderModels\n        ).map(\n          (name) => ({\n            model: name,\n          })\n        ),\n\n      context: {\n        locale,\n        session_id:\n          sessionId,\n\n        original_message:\n          message,\n\n        category_hint:\n          genderHint,\n      },\n\n      candidates,\n\n      topCandidates:\n        productPreview(\n          candidates,\n          10\n        ),\n    });\n  }\n}\n\n// ------------------------------------------------------------\n// E. GENERAL FUZZY MODEL MATCHING\n// ------------------------------------------------------------\nif (!model) {\n  const scoredModels =\n    models\n      .map(\n        (\n          candidateModel\n        ) => ({\n          model:\n            candidateModel,\n\n          ...scoreSpecificModel(\n            candidateModel\n          ),\n        })\n      )\n      .sort(\n        (a, b) =>\n          b.score - a.score\n      );\n\n  const best =\n    scoredModels[0];\n\n  const second =\n    scoredModels[1];\n\n  if (\n    best &&\n    best.score >= 0.72 &&\n    best.coverage >= 0.5 &&\n    (\n      !second ||\n      best.score -\n        second.score >=\n        0.08\n    )\n  ) {\n    model = best.model;\n  } else {\n    const bestScore =\n      best?.score || 0;\n\n    let plausible =\n      scoredModels.filter(\n        (item) =>\n          item.score >= 0.35 &&\n          item.score >=\n            bestScore - 0.12\n      );\n\n    if (\n      !plausible.length\n    ) {\n      plausible =\n        scoredModels.slice(\n          0,\n          6\n        );\n    }\n\n    plausible =\n      plausible.slice(\n        0,\n        8\n      );\n\n    const names =\n      plausible.map(\n        (item) =>\n          item.model\n      );\n\n    const candidates =\n      products.filter(\n        (product) =>\n          names.includes(\n            product.model\n          )\n      );\n\n    return questionResult({\n      questionKey:\n        \"ambiguous_model\",\n\n      options:\n        plausible.map(\n          (item) => ({\n            model:\n              item.model,\n\n            score:\n              Number(\n                item.score.toFixed(\n                  2\n                )\n              ),\n          })\n        ),\n\n      context: {\n        locale,\n\n        session_id:\n          sessionId,\n\n        original_message:\n          message,\n      },\n\n      candidates,\n\n      topCandidates:\n        productPreview(\n          candidates,\n          10\n        ),\n    });\n  }\n}\n\n// ------------------------------------------------------------\n// 9. FILTER PRODUCTS BY SELECTED MODEL\n// ------------------------------------------------------------\nconst modelProducts =\n  products.filter(\n    (product) =>\n      product.model ===\n      model\n  );\n\nconst colors =\n  unique(\n    modelProducts.map(\n      (product) =>\n        product.color\n    )\n  );\n\n// ------------------------------------------------------------\n// 10. MULTILINGUAL COLOR ALIASES\n// ------------------------------------------------------------\nconst colorAliases = {\n  black: [\n    \"black\",\n    \"schwarz\",\n    \"noir\",\n    \"negro\",\n    \"negra\",\n  ],\n\n  white: [\n    \"white\",\n    \"weiss\",\n    \"blanc\",\n    \"blanche\",\n    \"blanco\",\n    \"blanca\",\n  ],\n\n  grey: [\n    \"grey\",\n    \"gray\",\n    \"grau\",\n    \"gris\",\n  ],\n\n  blue: [\n    \"blue\",\n    \"blau\",\n    \"bleu\",\n    \"azul\",\n  ],\n\n  green: [\n    \"green\",\n    \"grun\",\n    \"gruen\",\n    \"vert\",\n    \"verde\",\n  ],\n\n  red: [\n    \"red\",\n    \"rot\",\n    \"rouge\",\n    \"rojo\",\n    \"roja\",\n  ],\n\n  pink: [\n    \"pink\",\n    \"rosa\",\n    \"rose\",\n  ],\n\n  brown: [\n    \"brown\",\n    \"braun\",\n    \"marron\",\n  ],\n\n  purple: [\n    \"purple\",\n    \"violet\",\n    \"lila\",\n    \"morado\",\n    \"morada\",\n  ],\n\n  yellow: [\n    \"yellow\",\n    \"gelb\",\n    \"jaune\",\n    \"amarillo\",\n    \"amarilla\",\n  ],\n\n  orange: [\n    \"orange\",\n  ],\n\n  beige: [\n    \"beige\",\n  ],\n};\n\nfunction canonicalColorWord(\n  word\n) {\n  const normalized =\n    normalize(word);\n\n  for (\n    const [\n      canonical,\n      aliases,\n    ] of Object.entries(\n      colorAliases\n    )\n  ) {\n    if (\n      aliases.some(\n        (alias) =>\n          normalize(alias) ===\n            normalized ||\n          isStrongWordMatch(\n            alias,\n            normalized\n          )\n      )\n    ) {\n      return canonical;\n    }\n  }\n\n  return normalized;\n}\n\nfunction colorWordSimilarity(\n  a,\n  b\n) {\n  return similarity(\n    canonicalColorWord(a),\n    canonicalColorWord(b)\n  );\n}\n\nfunction colorWordMatches(\n  a,\n  b\n) {\n  return isStrongWordMatch(\n    canonicalColorWord(a),\n    canonicalColorWord(b)\n  );\n}\n\n// ------------------------------------------------------------\n// Remove model/gender/filler words before searching for color.\n// ------------------------------------------------------------\nconst modelTokens =\n  tokenize(model);\n\nconst allAliasTokens =\n  Object.values(\n    modelAliases\n  )\n    .flat()\n    .flatMap(\n      (alias) =>\n        tokenize(alias)\n    );\n\nconst allGenderTokens =\n  Object.values(\n    genderHints\n  )\n    .flat()\n    .flatMap(\n      (hint) =>\n        tokenize(hint)\n    );\n\nconst possibleColorInputTokens =\n  queryTokens.filter(\n    (queryToken) => {\n      if (\n        isStopWord(\n          queryToken\n        )\n      ) {\n        return false;\n      }\n\n      if (\n        /^\\d+(?:\\.\\d+)?$/.test(\n          queryToken\n        )\n      ) {\n        return false;\n      }\n\n      const modelWord =\n        modelTokens.some(\n          (modelToken) =>\n            isStrongWordMatch(\n              queryToken,\n              modelToken\n            )\n        );\n\n      if (modelWord) {\n        return false;\n      }\n\n      const aliasWord =\n        allAliasTokens.some(\n          (aliasToken) =>\n            isStrongWordMatch(\n              queryToken,\n              aliasToken\n            )\n        );\n\n      if (aliasWord) {\n        return false;\n      }\n\n      const genderWord =\n        allGenderTokens.some(\n          (genderToken) =>\n            hintMatches(\n              queryToken,\n              genderToken\n            )\n        );\n\n      if (genderWord) {\n        return false;\n      }\n\n      return true;\n    }\n  );\n\n// ------------------------------------------------------------\n// 11. COLOR MATCHING\n// ------------------------------------------------------------\nlet color = null;\n\n// A. Exact complete color phrase.\nconst exactColors =\n  colors\n    .filter(\n      (\n        candidateColor\n      ) =>\n        q.includes(\n          normalize(\n            candidateColor\n          )\n        )\n    )\n    .sort(\n      (a, b) =>\n        normalize(b).length -\n        normalize(a).length\n    );\n\nif (\n  exactColors.length\n) {\n  color =\n    exactColors[0];\n}\n\n// B. Fuzzy color matching.\nif (!color) {\n  const scoredColors =\n    colors\n      .map(\n        (\n          candidateColor\n        ) => {\n          const candidateTokens =\n            tokenize(\n              candidateColor\n            );\n\n          let matched = 0;\n          let total = 0;\n\n          for (\n            const candidateToken of\n              candidateTokens\n          ) {\n            let best = 0;\n\n            for (\n              const queryToken of\n                possibleColorInputTokens\n            ) {\n              const sim =\n                colorWordSimilarity(\n                  candidateToken,\n                  queryToken\n                );\n\n              if (\n                colorWordMatches(\n                  candidateToken,\n                  queryToken\n                ) ||\n                sim >= 0.76\n              ) {\n                best =\n                  Math.max(\n                    best,\n                    sim\n                  );\n              }\n            }\n\n            if (best > 0) {\n              matched++;\n              total += best;\n            }\n          }\n\n          const coverage =\n            candidateTokens.length\n              ? matched /\n                candidateTokens.length\n              : 0;\n\n          const average =\n            matched\n              ? total / matched\n              : 0;\n\n          const score =\n            average * 0.7 +\n            coverage * 0.3;\n\n          return {\n            color:\n              candidateColor,\n\n            score,\n            coverage,\n            matched,\n          };\n        }\n      )\n      .filter(\n        (item) =>\n          item.matched > 0 &&\n          item.coverage >= 0.5\n      )\n      .sort(\n        (a, b) =>\n          b.score - a.score\n      );\n\n  const best =\n    scoredColors[0];\n\n  if (\n    best &&\n    best.score >= 0.77\n  ) {\n    const close =\n      scoredColors.filter(\n        (item) =>\n          item.score >=\n          best.score - 0.06\n      );\n\n    if (\n      close.length === 1\n    ) {\n      color =\n        best.color;\n    } else {\n      const options =\n        sortNatural(\n          unique(\n            close.map(\n              (item) =>\n                item.color\n            )\n          )\n        );\n\n      const candidates =\n        modelProducts.filter(\n          (product) =>\n            options.includes(\n              product.color\n            )\n        );\n\n      return questionResult({\n        questionKey:\n          \"missing_color\",\n\n        options,\n\n        context: {\n          model,\n          locale,\n\n          session_id:\n            sessionId,\n\n          original_message:\n            message,\n\n          color_hint:\n            possibleColorInputTokens.join(\n              \" \"\n            ),\n        },\n\n        candidates,\n      });\n    }\n  }\n}\n\n// C. No color was provided / recognized.\nif (!color) {\n  if (\n    colors.length === 1\n  ) {\n    color =\n      colors[0];\n  } else {\n    return questionResult({\n      questionKey:\n        \"missing_color\",\n\n      options:\n        sortNatural(\n          colors\n        ),\n\n      context: {\n        model,\n        locale,\n\n        session_id:\n          sessionId,\n\n        original_message:\n          message,\n      },\n\n      candidates:\n        modelProducts,\n    });\n  }\n}\n\n// ------------------------------------------------------------\n// 12. FILTER MODEL + COLOR\n// ------------------------------------------------------------\nconst colorProducts =\n  modelProducts.filter(\n    (product) =>\n      product.color ===\n      color\n  );\n\nconst sizes =\n  unique(\n    colorProducts.map(\n      (product) =>\n        product.size\n    )\n  );\n\n// ------------------------------------------------------------\n// 13. SIZE HELPERS\n// ------------------------------------------------------------\nfunction extractNumbers(\n  value\n) {\n  return (\n    String(value || \"\")\n      .match(\n        /\\d+(?:[.,]\\d+)?/g\n      )\n      ?.map(\n        (number) =>\n          number.replace(\n            \",\",\n            \".\"\n          )\n      ) || []\n  );\n}\n\nfunction numbersInSize(\n  sizeLabel\n) {\n  return extractNumbers(\n    sizeLabel\n  );\n}\n\n// English: size\n// German: Größe / Groesse\n// French: taille\n// Spanish: talla\nconst explicitSizeRegex =\n  /\\b(size|grosse|groesse|taille|talla)\\b\\s*(?:is\\s*)?([a-z0-9./+-]+)/i;\n\nconst explicitSizeMatch =\n  q.match(\n    explicitSizeRegex\n  );\n\nconst explicitRequestedSize =\n  explicitSizeMatch\n    ? explicitSizeMatch[2]\n    : null;\n\nlet size = null;\n\n// ------------------------------------------------------------\n// A. EXACT EXPLICIT SIZE\n// ------------------------------------------------------------\nif (\n  explicitRequestedSize\n) {\n  size =\n    sizes.find(\n      (catalogSize) =>\n        normalize(\n          catalogSize\n        ) ===\n        normalize(\n          explicitRequestedSize\n        )\n    );\n}\n\n// ------------------------------------------------------------\n// B. EXACT GROUPED SIZE\n//\n// Example:\n// 40/41\n// ------------------------------------------------------------\nif (!size) {\n  const grouped =\n    sizes.filter(\n      (catalogSize) =>\n        normalize(\n          catalogSize\n        ).includes(\"/\") &&\n        q.includes(\n          normalize(\n            catalogSize\n          )\n        )\n    );\n\n  if (\n    grouped.length === 1\n  ) {\n    size =\n      grouped[0];\n  }\n}\n\n// ------------------------------------------------------------\n// C. SMART NUMERIC SIZE\n//\n// User: 39\n// Catalog: 38/39\n// ------------------------------------------------------------\nif (!size) {\n  let requestedNumbers =\n    explicitRequestedSize\n      ? extractNumbers(\n          explicitRequestedSize\n        )\n      : [];\n\n  if (\n    !requestedNumbers.length\n  ) {\n    const messageNumbers =\n      extractNumbers(\n        message\n      );\n\n    const modelNumbers =\n      extractNumbers(\n        model\n      );\n\n    requestedNumbers =\n      messageNumbers.filter(\n        (number) =>\n          !modelNumbers.includes(\n            number\n          )\n      );\n  }\n\n  if (\n    requestedNumbers.length\n  ) {\n    const matchingSizes =\n      sizes.filter(\n        (catalogSize) => {\n          const availableNumbers =\n            numbersInSize(\n              catalogSize\n            );\n\n          return (\n            requestedNumbers.some(\n              (requested) =>\n                availableNumbers.includes(\n                  requested\n                )\n            )\n          );\n        }\n      );\n\n    if (\n      matchingSizes.length ===\n      1\n    ) {\n      size =\n        matchingSizes[0];\n    } else if (\n      matchingSizes.length >\n      1\n    ) {\n      const options =\n        sortNatural(\n          matchingSizes\n        );\n\n      return questionResult({\n        questionKey:\n          \"missing_size\",\n\n        options,\n\n        context: {\n          model,\n          color,\n          locale,\n\n          session_id:\n            sessionId,\n\n          original_message:\n            message,\n\n          requested_size:\n            explicitRequestedSize ||\n            requestedNumbers.join(\n              \", \"\n            ),\n        },\n\n        candidates:\n          colorProducts.filter(\n            (product) =>\n              options.includes(\n                product.size\n              )\n          ),\n      });\n    }\n  }\n}\n\n// ------------------------------------------------------------\n// D. TEXT SIZES: S / M / L / XL etc.\n// ------------------------------------------------------------\nif (\n  !size &&\n  explicitRequestedSize\n) {\n  const requested =\n    normalize(\n      explicitRequestedSize\n    );\n\n  const textMatches =\n    sizes.filter(\n      (catalogSize) =>\n        normalize(\n          catalogSize\n        ) === requested\n    );\n\n  if (\n    textMatches.length ===\n    1\n  ) {\n    size =\n      textMatches[0];\n  }\n}\n\n// ------------------------------------------------------------\n// E. MISSING SIZE\n// ------------------------------------------------------------\nif (!size) {\n  if (\n    sizes.length === 1\n  ) {\n    size =\n      sizes[0];\n  } else {\n    return questionResult({\n      questionKey:\n        \"missing_size\",\n\n      options:\n        sortNatural(\n          sizes\n        ),\n\n      context: {\n        model,\n        color,\n        locale,\n\n        session_id:\n          sessionId,\n\n        original_message:\n          message,\n\n        requested_size:\n          explicitRequestedSize ||\n          null,\n      },\n\n      candidates:\n        colorProducts,\n    });\n  }\n}\n\n// ------------------------------------------------------------\n// 14. FINAL EXACT PRODUCT VARIANT\n// ------------------------------------------------------------\nconst exactProducts =\n  colorProducts.filter(\n    (product) =>\n      product.size ===\n      size\n  );\n\nif (\n  !exactProducts.length\n) {\n  return questionResult({\n    questionKey:\n      \"missing_size\",\n\n    options:\n      sortNatural(\n        sizes\n      ),\n\n    context: {\n      model,\n      color,\n      locale,\n\n      session_id:\n        sessionId,\n\n      original_message:\n        message,\n    },\n\n    candidates:\n      colorProducts,\n  });\n}\n\nconst product =\n  exactProducts[0];\n\n// ------------------------------------------------------------\n// 15. SUCCESS\n// ------------------------------------------------------------\nreturn [\n  {\n    json: {\n      type: \"match\",\n\n      product: {\n        id:\n          product.id,\n\n        title:\n          product.title,\n\n        image_url:\n          product.image_url,\n      },\n\n      context: {\n        model,\n        color,\n        size,\n        locale,\n\n        session_id:\n          sessionId,\n\n        original_message:\n          message,\n      },\n\n      matched_candidates: [\n        {\n          id:\n            product.id,\n\n          title:\n            product.title,\n\n          image_url:\n            product.image_url,\n\n          model:\n            product.model,\n\n          color:\n            product.color,\n\n          size:\n            product.size,\n        },\n      ],\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -480,
+        288
+      ],
+      "id": "394df4a0-8c55-4f82-a744-e48d005fa7f7",
+      "name": "Code in JavaScript"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{\n  {\n    success: true,\n    message: $(\"AI Agent\").first().json.output,\n    result: $(\"Code in JavaScript\").first().json\n  }\n}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        0,
+        544
+      ],
+      "id": "8d21ad5c-f24a-4670-97f4-4995d64ef02d",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "ZEDnRXUu2DXkPpKC",
+          "mode": "list",
+          "cachedResultName": "Products",
+          "cachedResultUrl": "/projects/cBIOzBpCNyhen80W/datatables/ZEDnRXUu2DXkPpKC"
+        },
+        "limit": 1000
+      },
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -736,
+        288
+      ],
+      "id": "f4816437-c816-46e8-ac7c-1cd830e9bcff",
+      "name": "Get row(s)"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "={{ JSON.stringify($json) }}",
+        "options": {
+          "systemMessage": "You are the response formatter for the Pammys Product Finder.\n\nYou receive structured JSON that has already been produced by deterministic product-matching logic.\n\nIMPORTANT:\n- Do NOT perform product matching yourself.\n- Do NOT choose a different product.\n- Do NOT invent models, colors, sizes, products, options, or values.\n- Use only information contained in the provided JSON.\n- Respond in the language specified by context.locale:\n  en = English\n  de = German\n  fr = French\n  es = Spanish\n\nRESPONSE RULES:\n\nIf type = \"match\":\n- Give a short, natural confirmation.\n- Mention the matched product title.\n- You may mention model, color, and size if useful.\n- Do NOT mention the product ID.\n- Do NOT print or mention image_url.\n- Do NOT include raw URLs.\n- Do NOT offer to add the product to a cart.\n- Do NOT ask about availability.\n- Do NOT offer purchasing, checkout, shipping, stock checking, or other unsupported actions.\n- Do NOT ask an additional question after confirming the product.\n\nExample:\n\"Got it — I found Originals Woman - Toffee Cream - 38/39.\"\n\nIf question_key = \"missing_size\":\n- Ask which size the user means.\n- Include the model and color.\n- Only use the size options provided in the JSON.\n- Do not invent additional sizes.\n\nExample:\n\"Which size for Snowboots 2.0 in Nightfall do you mean?\"\n\nIf question_key = \"missing_color\":\n- Ask which color the user means.\n- Include the model.\n- Only use the color options provided in the JSON.\n\nExample:\n\"Which color for Snowboots 2.0 do you mean?\"\n\nIf question_key = \"ambiguous_model\":\n- Ask which model the user means.\n- Only use model options provided in the JSON.\n\nExample:\n\"Which of these models do you mean?\"\n\nKeep every response short, clear, factual, and natural.\nNever output JSON.\nNever output image URLs.\nNever mention internal IDs."
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        -288,
+        288
+      ],
+      "id": "287cbaac-a484-4e21-97cc-f86cd235a233",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "=gpt-5-mini",
+          "mode": "id"
+        },
+        "responsesApiEnabled": "pp",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.3,
+      "position": [
+        -288,
+        448
+      ],
+      "id": "7be53020-1572-4036-8281-c4b2b589d9e7",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "tghKWpxo67NLfKsc",
+          "name": "n8n free OpenAI API credits"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "18B-_FAtrRo7YzPx-XdfMunFWkth7xEUl6UvpCUofUoQ",
+          "mode": "list",
+          "cachedResultName": "Pammys History",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/18B-_FAtrRo7YzPx-XdfMunFWkth7xEUl6UvpCUofUoQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Sheet2",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "timestamp": "={{ $now.toISO() }}",
+            "session_id": "={{ $(\"Code in JavaScript\").first().json.context.session_id }}",
+            "locale": "={{ $(\"Code in JavaScript\").first().json.context.locale }}",
+            "user_message": "={{ $(\"Code in JavaScript\").first().json.context.original_message }}",
+            "assistant_message": "={{ $(\"AI Agent\").first().json.output }}",
+            "product_title": "={{ $(\"Code in JavaScript\").first().json.product?.title || \"\" }}",
+            "image_url": "={{ $(\"Code in JavaScript\").first().json.product?.image_url || \"\" }}",
+            "candidate_images": "={{ JSON.stringify($(\"Code in JavaScript\").first().json.matched_candidates || []) }}",
+            "result_type": "={{ $(\"Code in JavaScript\").first().json.type }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "session_id",
+              "displayName": "session_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "locale",
+              "displayName": "locale",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "user_message",
+              "displayName": "user_message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "result_type",
+              "displayName": "result_type",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "assistant_message",
+              "displayName": "assistant_message",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "product_title",
+              "displayName": "product_title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "image_url",
+              "displayName": "image_url",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "candidate_images",
+              "displayName": "candidate_images",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        16,
+        288
+      ],
+      "id": "979d3e4c-5a27-4ef3-9f15-66138623fb80",
+      "name": "Append row in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YiIJxsD2Y7bO6Drv",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.body.action }}",
+                    "rightValue": "search",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "id": "0dce5aa0-39d1-4277-b8d4-24ed9e0fe94e"
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "9861ec16-e962-4ca7-8a5a-1b249c49002a",
+                    "leftValue": "={{ $json.body.action }}",
+                    "rightValue": "history",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "looseTypeValidation": "={{ false }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        -928,
+        288
+      ],
+      "id": "cf3e0c95-ae5b-4733-92fd-09472ed656a6",
+      "name": "Switch"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "18B-_FAtrRo7YzPx-XdfMunFWkth7xEUl6UvpCUofUoQ",
+          "mode": "list",
+          "cachedResultName": "Pammys History",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/18B-_FAtrRo7YzPx-XdfMunFWkth7xEUl6UvpCUofUoQ/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 352335744,
+          "mode": "list",
+          "cachedResultName": "Sheet2",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/18B-_FAtrRo7YzPx-XdfMunFWkth7xEUl6UvpCUofUoQ/edit#gid=352335744"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        -944,
+        512
+      ],
+      "id": "c9992a08-d2ec-4649-8463-8cc29b2258d8",
+      "name": "Get row(s) in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YiIJxsD2Y7bO6Drv",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const history = $input.all().map(\n  item => item.json\n);\n\nhistory.sort(\n  (a, b) =>\n    new Date(b.timestamp) -\n    new Date(a.timestamp)\n);\n\nreturn [\n  {\n    json: {\n      success: true,\n      history\n    }\n  }\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -752,
+        512
+      ],
+      "id": "e3d7a9f4-9eb8-4b55-be08-fcc667117764",
+      "name": "Code in JavaScript1"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        -576,
+        512
+      ],
+      "id": "5c2a95d3-aa7d-49ed-895b-72ddccde7fbb",
+      "name": "Respond to Webhook1"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Switch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s)": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Append row in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch": {
+      "main": [
+        [
+          {
+            "node": "Get row(s)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get row(s) in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s) in sheet": {
+      "main": [
+        [
+          {
+            "node": "Code in JavaScript1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Code in JavaScript1": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Append row in sheet": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "3f87af7b-2c17-43a6-b190-e1b1f7128a7c",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "e5805d2fd98b45e922b16fc82932325e27d20aa67e00b200c014888544593e54"
+  },
+  "nodeGroups": [],
+  "id": "lDmwu27aG1Cf73Ht",
+  "tags": []
+}
